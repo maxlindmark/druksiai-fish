@@ -51,3 +51,5 @@ rsconnect/
 # large posterior output
 output/supp/prior_post_all_mono.csv
 output/preds_all_mono.csv
+output/supp/preds_all_mono.csv
+output/prior_post_all_mono.csv
