@@ -1,0 +1,519 @@
+---
+title: "Length-at-age data preparation and modelling"
+author: "Max Lindmark & Asta Audzijonyte"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    embed-resources: true
+    fig-width: 12
+    fig-height: 10
+editor: source
+execute: 
+  echo: true
+  eval: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.align = "center"
+)
+```
+
+### Load packages
+
+```{r}
+#| warning: false
+#| message: false
+pkgs <- c("here", "tidyverse", "RColorBrewer", "viridis", "mgcv", "sdmTMB", "patchwork", "tidylog", "gratia", "readxl")
+
+# minpack.lm needed if using nlsLM()
+if (length(setdiff(pkgs, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(pkgs, rownames(installed.packages())), dependencies = T)
+}
+
+invisible(lapply(pkgs, library, character.only = T))
+
+# Continuous colors
+options(ggplot2.continuous.colour = "viridis")
+
+# Not on CRAN !
+# devtools::install_github("seananderson/ggsidekick")
+library(ggsidekick)
+theme_set(theme_sleek())
+
+# Set relative path
+home <- here::here()
+```
+
+### Read data
+Read and join fish data and temperature data.
+
+```{r read and clean data}
+#| warning: false
+#| message: false
+
+# Clean data
+df <- read_excel(paste0(home, "/data/DruksiaiFish_2022march.xls")) |> dplyr::select(-"...15")
+
+df <- df |>
+  rename(
+    year = Year,
+    age = Age,
+    area = Zone,
+    species = Species,
+    sex = Sex,
+    month = Month,
+    data_source = Data_source
+  ) |>
+  mutate(
+    stage = NA,
+    stage = ifelse(year < 1982, "a", stage),
+    stage = ifelse(year >= 1982 & year <= 2003, "b", stage),
+    stage = ifelse(year >= 2004, "c", stage)
+  )
+
+
+df2 <- df |>
+  mutate(
+    area = case_match(area,
+      c("šalta z.", "šalta z. ") ~ "cold",
+      c("šilta z.", "šilta z. ") ~ "warm",
+      c("37 kv.", "4 kv.", "49 kv.") ~ "unclear",
+      .default = area
+    )
+  )
+
+# Add temperatures
+temp_df <- read_csv(file = paste0(home, "/output/merged_temp_covar_data.csv")) |>
+  filter(.width == 0.95) |> # this just because rows are duplicate for each width! doesnt matter sinse we use median instead (ignore that the column is called mean; it's calculated with median_qi from tidybayes)
+  dplyr::select(mean_lst, year) |>
+  rename(lst = mean_lst)
+
+df <- left_join(df, temp_df, by = "year")
+
+df <- df |>
+  mutate(lst = ifelse(year < min(temp_df$year), mean(filter(temp_df, year < 1982)$lst), lst),
+         year = as.numeric(year))
+
+xtabs(~ species + year, data = df)
+
+length(which(is.na(df$L == T)))
+length(which(is.na(df$l == T)))
+
+# Rename species to common names
+unique(df$species)
+
+df <- df |>
+  filter(species %in% c(
+    "Abramis brama", "Alburnus alburnus", "Blicca bjoerkna", "Gymnocephalus cernua",
+    "Gymnocephalus cernua", "Sardinius erythrophthalmus", "Tinca tinca",
+    "Osmerus eperlanus", "Perca fluviatilis", "Coregonus albula",
+    "Esox lucius", "Rutilus rutilus"
+  )) |>
+  mutate(
+    species = fct_recode(species,
+      "Bream" = "Abramis brama",
+      "Bleak" = "Alburnus alburnus",
+      "Silver bream" = "Blicca bjoerkna",
+      "Ruffe" = "Gymnocephalus cernua",
+      "Rudde" = "Sardinius erythrophthalmus",
+      "Tench" = "Tinca tinca",
+      "Smelt" = "Osmerus eperlanus",
+      "Perch" = "Perca fluviatilis",
+      "Vendace" = "Coregonus albula",
+      "Pike" = "Esox lucius",
+      "Roach" = "Rutilus rutilus"
+    )
+  ) |>
+  drop_na(l)
+
+# Filter ages
+df |>
+  filter(species == "Roach") |>
+  ggplot(aes(l)) +
+  geom_histogram() +
+  facet_wrap(~year, scales = "free_y")
+
+# Some odd observations in roach - likely to be L and not l. For now we remove them
+df <- df |>
+  filter(
+    !(species == "Roach" & month == 5 & year == "1980"),
+    !(species == "Roach" & month == 8 & year == "1980" & age < 7),
+    !(species == "Roach" & age == 4 & l < 2)
+  )
+
+# Explore length vs age
+ggplot(df, aes(age, l, color = data_source)) +
+  facet_wrap(~species, scales = "free", ncol = 5) +
+  geom_point(alpha = 0.2) +
+  theme(legend.position = "bottom")
+
+# Some data entry errors in bream as well, filter these! (a 1 yr old bream is not 37 cm!)
+df <- df |>
+  mutate(keep = ifelse(species == "Bream" & age < 2 & l > 30, "N", "Y")) |>
+  filter(keep == "Y") |>
+  dplyr::select(-keep)
+
+# And in vendece...
+df <- df |>
+  mutate(keep = ifelse(species == "Vendace" & age >= 3 & l < 12, "N", "Y")) |>
+  filter(keep == "Y") |>
+  dplyr::select(-keep)
+
+# Replace NA with new level
+df <- df |> mutate(data_source = replace_na(data_source, "missing_data_source"))
+```
+
+To get covariates that represent the average temperatures during the lifetime, we'll here add lagged variables. This code can certainly be written in a better way but it does the job ... 
+
+```{r}
+# Add various lagged temperature metrics (average lifetime temperature etc). We don't have temperatures for the oldest cohorts, so we give them the average of the stage a period
+
+df <- df |> mutate(cohort = year - age)
+min(df$cohort, na.rm = TRUE)
+min(temp_df$year)
+min(temp_df$year) - min(df$cohort, na.rm = TRUE)
+
+# Need to extend it 17 years
+years_to_add <- seq(from = min(df$cohort, na.rm = TRUE), to = min(temp_df$year - 1))
+
+temp_df_temp <- data.frame(
+  year = years_to_add,
+  lst = rep(mean(filter(temp_df, year < 1982)$lst), length(years_to_add)),
+  stage = rep("a", length(years_to_add))
+)
+
+temp_df2 <- bind_rows(temp_df_temp, temp_df) |>
+  mutate(
+    stage = NA,
+    stage = ifelse(year < 1982, "a", stage),
+    stage = ifelse(year >= 1982 & year <= 2003, "b", stage),
+    stage = ifelse(year >= 2004, "c", stage)
+  ) |>
+  arrange(year)
+
+# Ok, now, based on the cohort and age, we need to average certain columns and match to the length-at-age data...
+# Lag variables equal to the oldest fish in the data
+temp_df2 <- temp_df2 |>
+  mutate(
+    lst_t_minus_1 = lag(lst, n = 1),
+    lst_t_minus_2 = lag(lst, n = 2),
+    lst_t_minus_3 = lag(lst, n = 3),
+    lst_t_minus_4 = lag(lst, n = 4),
+    lst_t_minus_5 = lag(lst, n = 5),
+    lst_t_minus_6 = lag(lst, n = 6),
+    lst_t_minus_7 = lag(lst, n = 7),
+    lst_t_minus_8 = lag(lst, n = 8),
+    lst_t_minus_9 = lag(lst, n = 9),
+    lst_t_minus_10 = lag(lst, n = 10),
+    lst_t_minus_11 = lag(lst, n = 11),
+    lst_t_minus_12 = lag(lst, n = 12),
+    lst_t_minus_13 = lag(lst, n = 13),
+    lst_t_minus_14 = lag(lst, n = 14),
+    lst_t_minus_15 = lag(lst, n = 15),
+    lst_t_minus_16 = lag(lst, n = 16),
+    lst_t_minus_17 = lag(lst, n = 17),
+    lst_t_minus_18 = lag(lst, n = 18),
+    lst_t_minus_19 = lag(lst, n = 19),
+    lst_t_minus_20 = lag(lst, n = 20),
+    lst_t_minus_21 = lag(lst, n = 21)
+  )
+
+# Add in the same years that I extended the temperature data with in the length so that I can do a left_join to get in the lagged variables
+years_to_add2 <- temp_df2 |>
+  dplyr::select(year) |>
+  filter(year < min(df$year))
+
+df2 <- bind_rows(years_to_add2, df)
+
+# Join in the lagged temperature variables to the length data. Before I do that though, it will be much easier indexing further down if temp (lst) is the last column...
+temp_col <- df2 |> dplyr::select(lst)
+
+df2 <- df2 |> dplyr::select(-lst)
+
+df2$lst <- temp_col$lst
+
+colnames(df2)
+
+# Now join
+df3 <- left_join(df2, temp_df2)
+
+# Check an example: age 5 fish in 1991
+df3 |>
+  filter(age == 5 & year == 1991) |>
+  dplyr::select(
+    year, cohort, age, l, species, lst, lst_t_minus_1, lst_t_minus_2, lst_t_minus_3,
+    lst_t_minus_4, lst_t_minus_5, lst_t_minus_6
+  ) |>
+  arrange(year) |>
+  head(1)
+
+temp_df |>
+  filter(year < 1992 & year > 1985) |>
+  as.data.frame() |>
+  arrange(desc(year))
+
+# Check an example: age 10 fish in 1980
+min(temp_df$year)
+df3 |>
+  filter(age == 10 & year == 1980) |>
+  dplyr::select(
+    year, cohort, age, l, species, lst, lst_t_minus_1, lst_t_minus_2, lst_t_minus_3,
+    lst_t_minus_4, lst_t_minus_5, lst_t_minus_6
+  ) |>
+  arrange(year) |>
+  head(1)
+
+temp_df |>
+  filter(year < 1981 & year > 1969) |>
+  as.data.frame() |>
+  arrange(desc(year))
+temp_df2 |>
+  filter(year < 1981 & year > 1969) |>
+  as.data.frame() |>
+  dplyr::select(lst, year) |>
+  arrange(desc(year))
+
+df3 |>
+  filter(year %in% c(1986, 1987, 1988, 1989, 1990, 1991)) |>
+  dplyr::select(
+    year, cohort, age, lst, lst_t_minus_1, lst_t_minus_2, lst_t_minus_3,
+    lst_t_minus_4, lst_t_minus_5, lst_t_minus_6
+  ) |>
+  arrange(year) |>
+  distinct(year, .keep_all = TRUE)
+
+# All good. What remains now is to take the average across the columns of lagged temperatures. The number of columns to calculate on depends on the age.
+
+df4 <- df3 |> drop_na(age)
+
+# Fill in columns with NA before looping
+df4$lifetime_avg_temp <- NA
+df4$birth_temp <- NA
+df4$first_two_yrs_temp <- NA
+
+str(df4)
+
+# Loop through all rows and calculate the average lifetime temperature by averaging across as many columns the fish is old
+for (i in 1:nrow(df4)) {
+  # temperatures start with temp on col #17; colnames(df4); df4 |> select(17) |> head()
+  # Lifetime
+  df4$lifetime_avg_temp[i] <- ifelse(df4$age[i] == 0,
+                                     df4[i, 17],
+                                     rowMeans(df4[i, 17:(17 + (df4$age[i]))])
+  )
+
+  # Birth temp
+  df4$birth_temp[i] <-
+    df4[i, (17 + (df4$age[i]))]
+}
+
+# Check it worked by plotting the temperatures in the growth data against manual calculations
+# Here, if age == 0, lst and birth temp and average lifetime birth temp should be the same
+df4 |>
+  filter(age == 0) |>
+  ggplot(aes(lst, lifetime_avg_temp)) +
+  geom_point() +
+  geom_abline()
+
+df4 |>
+  filter(age == 0) |>
+  ggplot(aes(lst, birth_temp)) +
+  geom_point() +
+  geom_abline()
+
+# Looks alright for age zeroes...
+
+# For age 1 fish, Test age one lifetime avg
+df4 |>
+  filter(age == 1) |>
+  mutate(lifetime_avg_temp2 = (lst + lst_t_minus_1) / 2) |> # manually calculate the average of current temperature and lagged 1 year temperature
+  ggplot(aes(lifetime_avg_temp2, lifetime_avg_temp)) +
+  geom_point() +
+  geom_abline()
+
+# Age 2
+df4 |>
+  filter(age == 2) |>
+  mutate(lifetime_avg_temp2 = (lst + lst_t_minus_1 + lst_t_minus_2) / 3) |> # manually calculate the average of current temperature and lagged 1 year and lagged 2 year temperatures
+  ggplot(aes(lifetime_avg_temp2, lifetime_avg_temp)) +
+  geom_point() +
+  geom_abline()
+
+# Age 3 birth temp
+df4 |>
+  filter(age == 3) |>
+  mutate(birth_temp2 = lst_t_minus_3) |>
+  ggplot(aes(birth_temp2, birth_temp)) +
+  geom_point() +
+  geom_abline()
+
+# Another test... all cohorts before 1978 should have the same temperature
+df4 |>
+  filter(cohort < 1978) |>
+  distinct(birth_temp)
+
+tt <- df4 |> filter(is.na(birth_temp))
+tt <- df4 |> filter(is.na(lifetime_avg_temp))
+```
+
+### Explore data
+
+```{r explore data}
+# if starting from here load df4
+# load(file = paste0(home, "/data/druksiai_beforeFiltering.RData"))
+
+# Sample size
+df4 |>
+  group_by(year, species, age) |>
+  summarise(n = n()) |>
+  ggplot(aes(year, n, fill = factor(age))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~species, scales = "free_y")
+
+# Histogram of lengths
+ggplot(df4, aes(l)) +
+  geom_histogram() +
+  facet_wrap(~species, scales = "free")
+```
+
+### Trim data
+
+```{r}
+# Trim data somewhat, and include datasource as a random effect
+df5 <- df4 |>
+  ungroup() |>
+  group_by(species, age) |>
+  mutate(
+    sd_l = sd(l, na.rm = TRUE),
+    mean_l = mean(l, na.rm = TRUE)
+  ) |>
+  filter(is.finite(sd_l)) |>
+  ungroup() |>
+  mutate(
+    keep = ifelse(l >= mean_l + 4 * sd_l, "N", "Y"),
+    keep = ifelse(l <= mean_l - 4 * sd_l, "N", keep)
+  )
+
+df5 <- df5 |> 
+    tidylog::filter(!(species == "Silver bream" & l < 5 & age > 10))
+
+ggplot(df5, aes(age, l, color = keep)) +
+  geom_jitter(alpha = 3/4) +
+  facet_wrap(~species, scales = "free", ncol = 3)
+
+df5 <- df5 |>
+  mutate(
+    data_source2 = case_when(
+      data_source == "žvynų knygutės" ~ "scales",
+      data_source == "missing_data_source" ~ "missing_data_source",
+      data_source %in% c("seni kompų hardai", "senų kompų hardai") ~ "digitised_old_data",
+      TRUE ~ "journal"
+    )
+  )
+
+ggplot(df5, aes(year, fill = data_source2)) +
+  geom_bar(stat = "count") +
+  facet_wrap(~species)
+
+# Fix some variables
+df5 <- df5 |>
+  drop_na(age) |>
+  drop_na(lifetime_avg_temp) |>
+  drop_na(month) |>
+  drop_na(l) |>
+  dplyr::select(-data_source) |>
+  rename(data_source = data_source2) |>
+  mutate(
+    f_month = as.factor(month),
+    f_age = as.factor(age),
+    f_data_source = as.factor(data_source)
+  )
+
+# vendace - 2-3 years;
+# bream - 5-7 years;
+# perch - 2-3 years;
+# roach - 3-5 years;
+# pike - 3 years.
+# Bleak (Alburnus) – 2-3 years;
+# Silverbream – 3-4 years
+# Ruffe – 2 years
+# Smelt – 2 years
+# Rudde (Scardinius) – 3-4 years
+# Tench (Tinca) – 3-5 years
+
+# Plot age distributions to figure out which constitutes "old" fish
+
+# Add maturation age by species
+df5 <- df5 |>
+  mutate(
+    life_stage = "Adult",
+    life_stage = ifelse(species == "Vendace" & age %in% c(2, 3), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Vendace" & age < 2, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Bream" & age %in% c(5, 6, 7), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Bream" & age < 5, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Perch" & age %in% c(2, 3), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Perch" & age < 2, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Roach" & age %in% c(3, 4, 5), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Roach" & age < 3, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Pike" & age %in% c(3), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Pike" & age < 3, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Bleak" & age %in% c(2, 3), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Bleak" & age < 2, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Silver bream" & age %in% c(3, 4), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Silver bream" & age < 3, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Ruffe" & age %in% c(2), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Ruffe" & age < 2, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Smelt" & age %in% c(2), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Smelt" & age < 2, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Rudde" & age %in% c(3, 4), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Rudde" & age < 3, "Juvenile", life_stage),
+    life_stage = ifelse(species == "Tench" & age %in% c(3, 4, 5), "Maturation age", life_stage),
+    life_stage = ifelse(species == "Tench" & age < 3, "Juvenile", life_stage)
+  ) |>
+  mutate(break_age = max(age) / 2) |>
+  mutate(life_stage = ifelse(age > break_age & life_stage == "Adult", "Old adult", life_stage))
+
+ggplot(df5, aes(age, fill = life_stage)) +
+  geom_histogram() +
+  facet_wrap(~species, scales = "free")
+```
+
+```{r}
+#| include: false
+# Relationship between response and predictors
+ggplot(df5, aes(lifetime_avg_temp, l, color = life_stage)) +
+  facet_wrap(~species, scales = "free") +
+  geom_point(alpha = 0.05) +
+  geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+# Final exploration:
+# yearly data distribution by species. Note, smelt has too few years and cohorts (short lived), so we will remove it
+df5 |>
+  group_by(species) |>
+  distinct(cohort, .keep_all = TRUE) |>
+  ggplot(aes(cohort, species)) +
+  geom_point()
+
+# smelt has only 12 cohorts, other species >20
+df5 |>
+  group_by(species) |>
+  summarise(n_cohorts = n_distinct(cohort)) |>
+  arrange(n_cohorts, desc(n_cohorts))
+```
+
+```{r save data}
+df6 <- df5 |>
+  filter(!species == "Smelt") |> 
+  filter(keep == "Y") |> 
+  dplyr::select(
+    year, species, l, age, f_age, f_month, stage, cohort, lst,
+    lifetime_avg_temp, birth_temp, data_source, f_data_source, life_stage
+  )
+
+save(df6, file = paste0(home, "/data/druksiai2.RData"))
+```

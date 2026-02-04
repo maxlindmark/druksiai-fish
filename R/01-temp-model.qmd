@@ -1,0 +1,645 @@
+---
+title: "Modelling temperature data as a covariate to length-at-age"
+author: "Max Lindmark & Asta Audzijonyte"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    embed-resources: true
+    fig-width: 12
+    fig-height: 10
+editor: source
+execute: 
+  echo: true
+  eval: true
+  cache: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.align = "center"
+)
+```
+
+### Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+pkgs <- c(
+  "here", "tidyverse", "RColorBrewer", "viridis", "brms", "patchwork", "tidylog",
+  "tidybayes", "lubridate", "tictoc", "modelr"
+)
+
+# minpack.lm needed if using nlsLM()
+if (length(setdiff(pkgs, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(pkgs, rownames(installed.packages())), dependencies = T)
+}
+
+invisible(lapply(pkgs, library, character.only = T))
+
+# Not on CRAN !
+# devtools::install_github("seananderson/ggsidekick")
+library(ggsidekick)
+theme_set(theme_sleek())
+
+# Set relative path
+home <- here::here()
+```
+
+# Temperature covariate
+
+In this script, we fit smooth models to satellite data in order to predict average temperatures across years, lake stations during the growing season. We then combine these with older in-situ samples of lake temperature to create a full time series, which we then merge with the fish length data set.
+
+### Read satellite and in-situ data
+
+```{r load data}
+#| message: false
+#| warning: false
+
+# Load data
+load(paste0(home, "/data/temp7_12.Rdata"))
+head(temp_7to12)
+
+load(paste0(home, "/data/lst_final.RData"))
+head(lst_final)
+
+d <- bind_rows(lst_final, temp_7to12) |>
+  ungroup() |>
+  mutate(lake_station = as.factor(Lake_name)) |>
+  drop_na(year) |>
+  rename(lst = ST)
+
+# Clean covariates
+d <- d |>
+  mutate(
+    yday = as.numeric(yday(Date)),
+    year = as.integer(year)
+  )
+
+# Remove south-east bay (Druksiai_sebay)
+unique(d$lake_station)
+d |> filter(lake_station == "Druksiai_sebay")
+d |> filter(lake_station == "Druksiai_sebay2")
+d <- d |>
+  filter(!lake_station == "Druksiai_sebay") |>
+  droplevels()
+
+# Insitu data
+d_insit <- read.csv(paste0(home, "/data/Druksiai_temperature_raw.csv")) |>
+  filter(place == "station1") |>
+  mutate(
+    Date = paste(Year, Month, Day, sep = "-"),
+    Date = as.Date(Date),
+    yday = as.numeric(yday(Date)),
+    year = as.integer(Year)
+  ) |>
+  rename("lst" = "Temp")
+```
+
+### Plot data
+
+```{r plot data}
+#| message: false
+#| warning: false
+
+# Plot satellite data
+ggplot(d, aes(yday, lst, color = lake_station)) +
+  geom_point() +
+  geom_smooth()
+
+ggplot(d, aes(yday, lst, color = factor(year))) +
+  geom_point(alpha = 0.4) +
+  facet_wrap(~lake_station)
+
+# Plot in-situ data
+ggplot(d_insit, aes(yday, lst)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~year)
+
+ggplot(d_insit, aes(yday, lst, color = factor(year))) +
+  geom_point() +
+  geom_line()
+
+ggplot(d, aes(yday)) +
+  geom_histogram() +
+  facet_wrap(~year)
+
+# Combine
+dd <- bind_rows(
+  d,
+  d_insit |>
+    dplyr::select(lst, yday, year, place) |>
+    rename(lake_station = place)
+) |>
+  mutate(year_f = as.factor(year)) |>
+  dplyr::select(-monSiteCode, -Lake_name, -Date, -satellite)
+
+mean_yday <- mean(dd$yday)
+sd_yday <- sd(dd$yday)
+
+unique(is.na(dd))
+```
+
+### Fit satelite + in-situ model
+
+In contrast to earlier versions, I pool in-situ and satelite. There isnt any overlap in stations, and stations differ in temperature, so it doesnt make sense to include "type" as a factor. I just treat it as a random site instead.
+
+```{r}
+#| message: false
+#| warning: false
+
+# s(yday): Seasonal pattern (shared)
+# year_f: Population-average year effects
+# (1 | lake_station): Persistent baseline difference for each station
+# (1 | year_f:lake_station): Year-specific deviations by station
+
+# m_prior <- brm(lst ~ s(yday, bs = "cc") +
+#                  year_f +
+#                  (1|lake_station) +
+#                  (1|year_f:lake_station),
+#                data = dd,
+#                family = student(),
+#                iter = 1,
+#                chains = 1,
+#                knots = list(yday = c(0.5, 366.5)))
+#
+# get_prior(m_prior)
+
+prior <- c(
+  prior(normal(0, 10), class = "b"),
+  prior(student_t(3, 18.2, 7.3), class = "Intercept"),
+  prior(student_t(3, 0, 7.3), class = "sds"),
+  prior(student_t(3, 0, 7.3), class = "sigma"),
+  prior(gamma(2, 0.1), class = "nu"),
+  prior(student_t(3, 0, 7.3), class = "sd", group = "lake_station"),
+  prior(student_t(3, 0, 7.3), class = "sd", group = "year_f:lake_station")
+)
+
+tic()
+m <- brm(
+  lst ~ s(yday, bs = "cc") + year_f +
+    (1|lake_station) +
+    (1|year_f:lake_station),
+  data = dd,
+  prior = prior,
+  sample_prior = "yes",
+  family = student(),
+  iter = 5000,
+  chains = 4,
+  cores = 4,
+  knots = list(yday = c(0.5, 366.5)),
+  control = list(adapt_delta = 0.99, max_treedepth = 15)
+)
+toc()
+# ~20 minutes
+```
+
+### Check model fit
+
+```{r evaluate models}
+#| message: false
+#| warning: false
+
+pp_check(m) +
+  scale_color_manual(
+    values = viridis(n = 5, option = "plasma")[c(2, 4)],
+    labels = c("obs", "yrep")
+  ) +
+  theme(
+    legend.position.inside = c(0.05, 0.95),
+    legend.title = element_blank()
+  ) +
+  labs(x = "Value", y = "Density") +
+  theme_sleek() +
+  guides(color = guide_legend(position = "inside")) +
+  theme(
+    legend.position.inside = c(0.1, 0.93),
+    legend.title = element_blank()
+  ) +
+  NULL
+
+ggsave(paste0(home, "/figures/supp/pp_check_temp.png"), width = 11, height = 11, units = "cm")
+```
+
+### Plot prior vs posterior
+
+```{r}
+# Get all posteriors (remove helper columns and prior columns)
+draws <- as_draws_df(m)
+
+posteriors <- draws |>
+  dplyr::select(
+    -starts_with("prior_"),
+    -lprior, -lp__,
+    -.chain, -.iteration, -.draw,
+    -starts_with("r_f_month"),
+    -Intercept
+  ) |>
+  pivot_longer(everything(),
+    names_to = "parameter",
+    values_to = "value"
+  ) |>
+  mutate(
+    parameter = case_when(
+      parameter == "sd_lake_station__Intercept" ~ "sd_lake_station",
+      parameter == "sd_year_f:lake_station__Intercept" ~ "sd_year_f:lake_station",
+      TRUE ~ parameter
+    ),
+    type = "posterior"
+  )
+
+# Get all priors
+priors <- draws |>
+  dplyr::select(starts_with("prior_"), -lprior) |>
+  pivot_longer(everything(),
+    names_to = "parameter",
+    values_to = "value"
+  ) |>
+  mutate(
+    parameter = str_remove(parameter, "^prior_"),
+    parameter = case_when(
+      parameter == "Intercept" ~ "b_Intercept",
+      TRUE ~ parameter
+    ),
+    type = "prior"
+  )
+
+prior_post <- bind_rows(posteriors, priors)
+
+# Group parameters to plot together
+
+prior_post_clean <- prior_post |>
+  mutate(
+    par_group = case_when(
+      str_starts(parameter, "b_Intercept") ~ "intercept",
+      str_starts(parameter, "b_y") ~ "b",
+      str_starts(parameter, "b") ~ "b",
+      # str_starts(parameter, "s_")    ~ "s_sds",
+      # str_starts(parameter, "sds_")  ~ "s_sds",
+      str_starts(parameter, "sigma") ~ "sigma_sd_nu",
+      str_starts(parameter, "sd_") ~ "sigma_sd_nu",
+      str_starts(parameter, "nu") ~ "sigma_sd_nu",
+      TRUE ~ NA
+    )
+  ) |>
+  drop_na(par_group)
+
+for (i in unique(prior_post_clean$par_group)) {
+  d_sub <- prior_post_clean |>
+    filter(par_group == i)
+
+  limits <- d_sub |>
+    filter(type == "posterior") |>
+    group_by(parameter) |>
+    summarise(
+      lower = quantile(value, 0.05),
+      upper = quantile(value, 0.975)
+    )
+
+  ncol <- if (i == "sigma_sd_nu") {
+    2
+  } else if (i == "b") {
+    10
+  } else {
+    4
+  }
+
+  if (i == "b") {
+    d_sub |>
+      left_join(limits, by = "parameter") |>
+      # filter(value > 0.1 * lower, value < upper * 10) |>
+      ggplot(aes(value)) +
+      geom_density(
+        data = \(d) d |> filter(type == "posterior"),
+        aes(fill = parameter, color = parameter),
+        alpha = 0.4,
+        color = NA
+      ) +
+      geom_density(
+        data = \(d) d |> filter(type == "prior"),
+        aes(group = parameter),
+        fill = "grey60",
+        alpha = 0.4,
+        color = "grey20"
+      ) +
+      scale_fill_viridis(option = "plasma", discrete = TRUE) +
+      scale_color_viridis(option = "plasma", discrete = TRUE) +
+      labs(x = "Value", y = "Density") +
+      coord_cartesian(expand = 0) +
+      theme(
+        strip.text.x.top = element_text(size = 8),
+        legend.position = "bottom",
+        legend.title = element_blank()
+      )
+  } else {
+    (
+
+      d_sub |>
+        left_join(limits, by = "parameter") |>
+        filter(value > 0.1 * lower, value < upper * 10) |>
+        ggplot(aes(value)) +
+        geom_density(
+          data = \(d) d |> filter(type == "posterior"),
+          aes(fill = parameter, color = parameter),
+          alpha = 0.4,
+          color = NA
+        ) +
+        geom_density(
+          data = \(d) d |> filter(type == "prior"),
+          aes(group = parameter),
+          fill = "grey60",
+          alpha = 0.4,
+          color = "grey20"
+        ) +
+        scale_fill_viridis(option = "plasma", discrete = TRUE) +
+        scale_color_viridis(option = "plasma", discrete = TRUE) +
+        labs(x = "Value", y = "Density") +
+        coord_cartesian(expand = 0) +
+        facet_wrap(~parameter, ncol = ncol, scales = "free") +
+        theme(
+          strip.text.x.top = element_text(size = 8),
+          legend.position = "bottom",
+          legend.title = element_blank()
+        )
+
+    )
+  }
+
+  ggsave(paste0(home, "/figures/supp/prior_post/prior_post_temp_", i, ".png"), width = 18, height = 22, units = "cm")
+}
+```
+
+### Predict from model
+
+```{r predict}
+#| message: false
+#| warning: false
+
+# Annual average growth season temperature by station
+gs_min <- yday("2020-05-01")
+gs_max <- yday("2020-10-15")
+
+# This is a pretty big prediction grid, so therefore I need to do it by site, then summarise, else the data frame explodes in size
+nd <- dd |>
+  distinct(lake_station, year_f) |>
+  expand_grid(yday = 1:365)
+
+pred_list <- list()
+
+for (i in unique(dd$lake_station)) {
+  nd_sub <- nd |> filter(lake_station == i)
+
+  pred_list[[i]] <- nd_sub |>
+    add_epred_draws(m) |>
+    group_by(lake_station, year_f, yday) |>
+    median_qi(.epred, .width = c(0.8, 0.95)) |>
+    ungroup()
+}
+
+pred_sum <- bind_rows(pred_list) |>
+  mutate(year = as.numeric(as.character(year_f)))
+
+pred_sum |>
+  filter(.width == 0.95) |> # this is just because the tibble is duplicated for each width
+  ggplot(aes(yday, .epred, color = lake_station)) +
+  geom_line() +
+  facet_wrap(~year) +
+  geom_point(data = d, aes(yday, lst, color = lake_station)) +
+  theme(legend.position = "bottom") +
+  scale_color_viridis(name = "Lake station", discrete = TRUE)
+
+# Heatmap
+pred_sum |>
+  filter(.width == 0.95) |>
+  ggplot(aes(yday, y = year, fill = .epred, color = .epred)) +
+  geom_raster() +
+  facet_wrap(~lake_station, ncol = 3) +
+  scale_fill_viridis(option = "magma") +
+  scale_color_viridis(option = "magma") +
+  labs(x = "Day of the year", y = "Year", color = "Predicted LST (°C)", fill = "Predicted LST (°C)") +
+  coord_cartesian(expand = 0) +
+  guides(fill = guide_colorbar(
+    title.position = "top", title.hjust = 0.5
+  )) +
+  theme(
+    legend.key.width = unit(0.9, "cm"),
+    legend.position = "bottom",
+  )
+
+ggsave(paste0(home, "/figures/supp/temp_station_heat.png"), width = 17, height = 22, units = "cm")
+
+# Summarise temp for a given time period and plot
+d_sum <- dd |>
+  filter(yday > gs_min & yday < gs_max) |>
+  group_by(year, lake_station) |>
+  summarise(mean_temp = mean(lst)) |>
+  ungroup()
+
+sum_pred_g <- pred_sum |>
+  # filter(.width == 0.95) |>
+  filter(yday > gs_min & yday < gs_max) |>
+  group_by(year, lake_station, .width) |>
+  summarise(
+    lwr = mean(.lower),
+    est = mean(.epred),
+    upr = mean(.upper)
+  ) |>
+  ungroup()
+
+sum_pred_g |>
+  mutate(lake_station = str_remove(lake_station, "Druksiai_")) |>
+  ggplot(aes(year, est,
+    linetype = "Model (95% C.I.)",
+    color = lake_station, fill = lake_station
+  )) +
+  facet_wrap(~lake_station, ncol = 3) +
+  geom_ribbon(
+    data = \(d) d |> filter(.width == 0.95),
+    aes(ymin = lwr, ymax = upr),
+    color = NA, alpha = 0.3
+  ) +
+  # geom_ribbon(data = \(d) d |> filter(.width == 0.8),
+  #             aes(ymin = lwr, ymax = upr),
+  #             color = NA, alpha = 0.1) +
+  geom_point(
+    data = d_sum |> mutate(lake_station = str_remove(lake_station, "Druksiai_")),
+    aes(year, mean_temp, shape = "Data"),
+    color = "grey30", inherit.aes = FALSE, size = 0.8
+  ) +
+  geom_line() +
+  scale_fill_viridis(option = "plasma", discrete = TRUE) +
+  scale_color_viridis(option = "plasma", discrete = TRUE) +
+  guides(
+    shape = guide_legend(
+      override.aes = list(size = 2)
+    ),
+    fill = "none", color = "none"
+  ) +
+  scale_y_continuous(breaks = seq(5, 40, by = 2)) +
+  labs(
+    x = "Year",
+    y = expression("Mean lake surface temperature (°C) (May 1"^"st" * "–Oct 15"^"th" * ")")
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.spacing.y = unit(-0.2, "cm"),
+    legend.title = element_blank()
+  )
+
+ggsave(paste0(home, "/figures/supp/temp_pred.png"), width = 17, height = 19, units = "cm")
+
+
+
+# Make a polar plot?
+pred_sum |> 
+  filter(.width == 0.95) |> 
+  summarise(.epred = mean(.epred), .by = c(lake_station, yday)) |> 
+  summary(.epred)
+
+pred_sum |> 
+  filter(.width == 0.95) |> 
+  summarise(.epred = mean(.epred), .by = c(lake_station, yday)) |> 
+  ggplot(aes(yday, .epred, color = lake_station)) + 
+  geom_line(linewidth = 1) + 
+  coord_polar(start = 0, direction = -1) +
+  scale_x_continuous(
+    breaks = c(1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335),
+    labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+    limits = c(0, 365)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 30, by = 5)
+  ) +
+  annotate("text", x = 1, y = 5, label = "5°C", size = 3.5, color = "grey40") +
+  annotate("text", x = 1, y = 10, label = "10°C", size = 3.5, color = "grey40") +
+  annotate("text", x = 1, y = 15, label = "15°C", size = 3.5, color = "grey40") +
+  annotate("text", x = 1, y = 20, label = "20°C", size = 3.5, color = "grey40") +
+  annotate("text", x = 1, y = 25, label = "25°C", size = 3.5, color = "grey40") +
+  scale_color_viridis_d(option = "magma", end = 0.9) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    color = "Lake Station"
+  )
+```
+
+## Now combine the series into a single that that we use a co-variate.
+
+```{r}
+#| message: false
+#| warning: false
+
+annual_trends <- dd |>
+  distinct(year) |>
+  mutate(year_f = as.factor(year)) |>
+  expand_grid(
+    yday = gs_min:gs_max
+  ) |>
+  add_epred_draws(
+    m,
+    re_formula = NA # average site
+  ) |>
+  ungroup() |> 
+  # Summarise across days-of-the day by averaging by earch draw and year only
+  summarise(
+    mean_lst = mean(.epred),
+    .by = c(.draw, year_f)
+  ) |>
+  # Summarise across draws
+  group_by(year_f) |>
+  median_qi(mean_lst, .width = c(0.8, 0.95)) |>
+  ungroup() |> 
+  mutate(year = as.numeric(as.character(year_f)))
+
+ggplot(annual_trends, aes(year, mean_lst)) +
+  geom_vline(xintercept = 1981, linetype = 2, alpha = 0.5) +
+  geom_vline(xintercept = 2009, linetype = 2, alpha = 0.5) +
+  geom_ribbon(
+    data = \(d) d |> filter(.width == 0.8),
+    aes(ymin = .lower, ymax = .upper),
+    color = NA, alpha = 0.3, fill = "grey50"
+  ) +
+  geom_ribbon(
+    data = \(d) d |> filter(.width == 0.95),
+    aes(ymin = .lower, ymax = .upper),
+    color = NA, alpha = 0.3, fill = "grey70"
+  ) +
+  geom_line() +
+  scale_y_continuous(breaks = seq(5, 40, by = 1)) +
+  labs(x = "Year", y = expression("Mean lake surface temperature (°C) (May 1"^"st" * "–Oct 15"^"th" * ")")) +
+  coord_cartesian(expand = 0) +
+  annotate("text", x = 1979.5, y = 23, label = "Pre\nwarming\n(a)", size = 2.5) +
+  annotate("text", x = 1991, y = 23, label = "During operation of power plant (b)", size = 2.5) +
+  annotate("text", x = 2016, y = 23, label = "Post operation of power plant (c)", size = 2.5) +
+  annotate(
+    "rect",
+    xmin = 1988, xmax = 2004,
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.08,
+    fill = "grey50"
+  ) +
+  annotate(
+    "text",
+    x = 1996, y = 13.6,
+    label = "2 reactors",
+    size = 2.5,
+    fontface = "italic"
+  ) +
+  annotate(
+    "text",
+    x = 1984.5, y = 13.6,
+    label = "1 reactor",
+    size = 2.5,
+    fontface = "italic"
+  ) +
+  annotate(
+    "text",
+    x = 2006.5, y = 13.6,
+    label = "1 reactor",
+    size = 2.5,
+    fontface = "italic"
+  )
+  # annotate(
+  #   "segment",
+  #   x = 1988, xend = 1988,
+  #   y = 14.1, yend = 13.3,
+  #   arrow = arrow(length = unit(0.15, "cm")),
+  #   linewidth = 0.4
+  # ) +
+  # annotate(
+  #   "text",
+  #   x = 1988, y = 14.3,
+  #   label = "Second reactor initiated",
+  #   size = 2.5,
+  #   hjust = 0.5
+  # ) +
+  # annotate(
+  #   "segment",
+  #   x = 2004, xend = 2004,
+  #   y = 14.1, yend = 13.3,
+  #   arrow = arrow(length = unit(0.15, "cm")),
+  #   linewidth = 0.4
+  # ) +
+  # annotate(
+  #   "text",
+  #   x = 2004, y = 14.3,
+  #   label = "Second reactor closed",
+  #   size = 2.5,
+  #   hjust = 0.5
+  # )
+
+ggsave(paste0(home, "/figures/temp_series.png"), width = 17, height = 11, units = "cm")
+```
+
+```{r save data}
+write_csv(annual_trends, paste0(home, "/output/merged_temp_covar_data.csv"))
+```

@@ -1,0 +1,494 @@
+---
+title: "Length-at-age modelling"
+author: "Max Lindmark & Asta Audzijonyte"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    embed-resources: true
+    fig-width: 12
+    fig-height: 10
+editor: source
+execute: 
+  echo: true
+  eval: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.align = "center"
+)
+```
+
+### Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+pkgs <- c(
+  "here", "tidyverse", "RColorBrewer", "viridis", "patchwork",
+  "tidylog", "modelr", "sdmTMBextra", "brms", "tidybayes", "tictoc"
+)
+
+# minpack.lm needed if using nlsLM()
+if (length(setdiff(pkgs, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(pkgs, rownames(installed.packages())), dependencies = T)
+}
+
+invisible(lapply(pkgs, library, character.only = T))
+
+# Not on CRAN !
+# devtools::install_github("seananderson/ggsidekick")
+library(ggsidekick)
+theme_set(theme_sleek())
+
+# Set relative path
+home <- here::here()
+
+# Set seed
+set.seed(99)
+```
+
+### Read data
+
+```{r load data}
+#| message: false
+#| warning: false
+
+load(file = paste0(home, "/data/druksiai2.RData"))
+
+# Scale values by species averages - lifetime and birth temperature and length
+d <- df6 |>
+  mutate(age_int = as.integer(round(age))) |> 
+  group_by(species) |>
+  mutate(
+    lifetime_avg_temp_sc = (lifetime_avg_temp - mean(lifetime_avg_temp)) / sd(lifetime_avg_temp),
+    birth_temp_sc = (birth_temp - mean(birth_temp)) / sd(birth_temp)
+    ) |>
+  ungroup()
+
+# Plot data
+f_labels <- d |>
+  group_by(species) |>
+  summarise(n = n()) |>
+  mutate(label = paste("n =", n))
+
+# ggplot(d, aes(age, l)) +
+#   geom_jitter(aes(color = cohort), alpha = 0.6, height = 0, width = 0.2, size = 0.5) +
+#   facet_wrap(~species, ncol = 3, scale = "free") +
+#   geom_text(
+#     data = f_labels, aes(label = label, hjust = -0.1, vjust = 1.5), inherit.aes = FALSE,
+#     x = -Inf, y = Inf, size = 2.3, color = "grey20"
+#   ) +
+#   labs(x = "Age (years)", y = "Length (cm)", color = "Cohort") +
+#   guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5)) +
+#   theme(
+#     legend.position = c(0.67, 0.12),
+#     legend.direction = "horizontal",
+#     legend.key.width = unit(0.6, "cm"),
+#     legend.key.height = unit(0.1, "cm")
+#   ) +
+#   scale_color_viridis(option = "mako")
+# 
+# ggsave(paste0(home, "/R/revision/figures/supp/data_plot.png"), width = 17, height = 17, units = "cm")
+
+# Summarise data for Table 1
+T1_summary <- d |>
+  summarise(
+    minYear = min(year),
+    maxYear = max(year),
+    minAge = min(age),
+    maxAge = max(age),
+    minSize = min(l),
+    maxSize = max(l),
+    nn = n(),
+    .by = species
+  ) |> 
+  arrange(species)
+
+T1_summary
+```
+
+### Fit size as a function of temperature and age
+
+In this model, we want to see if there are age-dependent effects of age in response to life-time average temperature. 
+
+```{r}
+#| message: false
+
+detach("package:tidylog", unload=TRUE)
+
+# Loop through all species
+prior_post <- list()
+ppc <- list()
+preds <- list()
+
+tic()
+for (i in unique(d$species)) {
+  
+  dd <- d |>
+    filter(species == i)
+  
+  print(i)
+
+  if (i == "Tench") {
+    # only one datasource for Tench so not included in the model
+    # better convergence if no month random effect
+
+    form <- l ~ mo(age_int)*lifetime_avg_temp_sc
+
+    dp <- default_prior(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity")
+      family = Gamma(link = "log")
+    )
+
+    dp$prior[dp$class == "b"] <- "normal(0, 10)"
+    dp <- dp[!(dp$class == "b" & dp$coef == ""), ]
+    print(dp)
+
+    fit <- brm(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity"),
+      family = Gamma(link = "log"),
+      sample_prior = "yes",
+      prior = dp,
+      chains = 4,
+      cores = 4,
+      seed = 99,
+      iter = 6000
+    )
+    
+  } else if (i %in% c("Ruffe", "Silver bream", "Rudde")) {
+    # too few months for Silver bream so not included
+    # also use this for Ruffe, Rudde, and Vendace because of convergence issues
+    form <- l ~ mo(age_int)*lifetime_avg_temp_sc + f_data_source
+
+    dp <- default_prior(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity")
+      family = Gamma(link = "log")
+    )
+
+    dp$prior[dp$class == "b"] <- "normal(0, 10)"
+    dp <- dp[!(dp$class == "b" & dp$coef == ""), ]
+    print(dp)
+
+    fit <- brm(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity"),
+      family = Gamma(link = "log"),
+      sample_prior = "yes",
+      prior = dp,
+      chains = 4,
+      cores = 4,
+      seed = 99,
+      iter = 6000,
+      control = list(adapt_delta = 0.9)
+      )
+    
+  } else if (i %in% c("Vendace")) {
+    form <- l ~ mo(age_int)*lifetime_avg_temp_sc
+
+    dp <- default_prior(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity")
+      family = Gamma(link = "log")
+    )
+
+    dp$prior[dp$class == "b"] <- "normal(0, 10)"
+    dp <- dp[!(dp$class == "b" & dp$coef == ""), ]
+    print(dp)
+    
+    fit <- brm(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity"),
+      family = Gamma(link = "log"),
+      sample_prior = "yes",
+      prior = dp,
+      chains = 4,
+      cores = 4,
+      seed = 99,
+      iter = 6000
+      )
+    
+  } else {
+    # for remaining species we use this model
+    form <- l ~ mo(age_int)*lifetime_avg_temp_sc + f_data_source + (1|f_month)
+
+    dp <- default_prior(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity")
+      family = Gamma(link = "log")
+    )
+
+    dp$prior[dp$class == "b"] <- "normal(0, 10)"
+    dp <- dp[!(dp$class == "b" & dp$coef == ""), ]
+    print(dp)
+    
+    fit <- brm(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity"),
+      family = Gamma(link = "log"),
+      sample_prior = "yes",
+      prior = dp,
+      chains = 4,
+      cores = 4,
+      seed = 99,
+      iter = 6000
+      )
+  }
+
+  print(fit)
+  
+  print(summary(rhat(fit)))
+  
+  # Extract posteriors and priors
+  draws <- as_draws_df(fit)
+
+  # Get all posteriors (remove helper columns and prior columns)
+  posteriors <- draws |>
+    dplyr::select(
+      -starts_with("prior_"),
+      -lprior, -lp__,
+      -.chain, -.iteration, -.draw,
+      -starts_with("r_f_month"),
+      -Intercept
+    ) |>
+    pivot_longer(everything(),
+      names_to = "parameter",
+      values_to = "value"
+    ) |>
+    mutate(
+      parameter = case_when(
+        parameter == "sd_f_month__Intercept" ~ "sd_f_month",
+        TRUE ~ parameter
+      ),
+      type = "posterior",
+      species = i
+    )
+
+  # Get all priors
+  priors <- draws |>
+    dplyr::select(starts_with("prior_"), -lprior) |>
+    pivot_longer(everything(),
+      names_to = "parameter",
+      values_to = "value"
+    ) |>
+    mutate(
+      parameter = str_remove(parameter, "^prior_"),
+      parameter = case_when(
+        parameter == "Intercept" ~ "b_Intercept",
+        TRUE ~ parameter
+      ),
+      type = "prior",
+      species = i
+    )
+
+  prior_post[[i]] <- bind_rows(posteriors, priors)
+
+  # Make posterior predictive check manually so that I can plot them together outside the loop
+  yrep <- posterior_predict(fit, ndraws = 10)
+
+  yrep_df <- tibble::tibble(
+    .draw = rep(1:nrow(yrep), times = ncol(yrep)),
+    .obs = rep(1:ncol(yrep), each = nrow(yrep)),
+    value = as.vector(yrep),
+    type = "yrep",
+    species = i
+  )
+
+  y_obs <- tibble(
+    .obs = seq_len(nrow(dd)),
+    value = dd$l,
+    type = "obs",
+    species = i,
+    .draw = NA_integer_
+  ) |>
+    mutate(value = as.vector(value))
+  
+  ppc[[i]] <- dplyr::bind_rows(yrep_df, y_obs)
+
+  # Main prediction
+  mean_temp <- round(mean(d$lifetime_avg_temp))
+  mean_temp
+    
+  pred_grid <- expand_grid(
+    age_int = seq(min(dd$age_int), max(dd$age_int)),
+    lifetime_avg_temp = c(mean_temp, mean_temp + 2)
+  ) |>
+    mutate(
+      lifetime_avg_temp_sc = (lifetime_avg_temp - mean(dd$lifetime_avg_temp)) / sd(dd$lifetime_avg_temp),
+      f_month = 7L,
+      f_data_source = "journal",
+      life_stage = case_when(
+        age_int <= max(filter(dd, life_stage == "Juvenile")$age_int, na.rm = TRUE) ~ "Juvenile",
+        age_int <= max(filter(dd, life_stage == "Maturation age")$age_int, na.rm = TRUE) ~ "Maturation age",
+        age_int <= max(filter(dd, life_stage == "Adult")$age_int, na.rm = TRUE) ~ "Adult",
+        TRUE ~ "Old adult"
+      )
+    )
+
+  pred_draws <- pred_grid |>
+    add_epred_draws(fit)
+
+  preds[[i]] <- pred_draws |>
+    mutate(species = i)
+  
+}
+toc()
+
+prior_post_all <- dplyr::bind_rows(prior_post)
+ppc_all <- dplyr::bind_rows(ppc)
+preds_all <- dplyr::bind_rows(preds)
+
+# Save
+write_csv(prior_post_all, paste0(home, "/output/prior_post_all_mono.csv"))
+write_csv(ppc_all, paste0(home, "/output/ppc_all_mono.csv"))
+write_csv(preds_all, paste0(home, "/output/preds_all_mono.csv"))
+```
+
+```{r}
+knitr::knit_exit()
+```
+
+```{r}
+i <- "Vendance"
+
+form <- l ~ mo(age_int)*lifetime_avg_temp_sc + f_data_source + (1|f_month)
+
+    dp <- default_prior(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity")
+      family = Gamma(link = "log")
+    )
+
+    dp$prior[dp$class == "b"] <- "normal(0, 10)"
+    dp <- dp[!(dp$class == "b" & dp$coef == ""), ]
+
+    fit <- brm(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity"),
+      family = Gamma(link = "log"),
+      #sample_prior = "yes",
+      #prior = dp,
+      chains = 4,
+      cores = 4,
+      seed = 99,
+      iter = 6000
+      )
+
+    form <- l ~ mo(age_int)*lifetime_avg_temp_sc# + f_data_source# + (1|f_month)
+
+    dp <- default_prior(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity")
+      family = Gamma(link = "log")
+    )
+
+    dp$prior[dp$class == "b"] <- "normal(0, 10)"
+    dp <- dp[!(dp$class == "b" & dp$coef == ""), ]
+
+    fit2 <- brm(
+      form,
+      data = dd,
+      #family = lognormal(link = "identity"),
+      family = Gamma(link = "log"),
+      #sample_prior = "yes",
+      #prior = dp,
+      chains = 4,
+      cores = 4,
+      seed = 99,
+      iter = 6000
+      )
+    
+loo::loo(fit, fit2)
+    
+conditional_effects(fit, "age_int", points = T, type = "point")
+conditional_effects(fit2, "age_int", points = T, type = "point")
+
+unique(dd$f_data_source)
+
+# dd |> 
+#   summarise(n = n(), .by = f_data_source)
+
+pred_draws <- expand_grid(
+    age_int = seq(min(dd$age_int), max(dd$age_int)),
+    lifetime_avg_temp_sc = c(0, 2)
+  ) |>
+    mutate(
+      f_month = 7L,
+      #f_data_source = "journal",
+      f_data_source = "scales",
+      life_stage = case_when(
+        age_int <= max(filter(dd, life_stage == "Juvenile")$age_int, na.rm = TRUE) ~ "Juvenile",
+        age_int <= max(filter(dd, life_stage == "Maturation age")$age_int, na.rm = TRUE) ~ "Maturation age",
+        age_int <= max(filter(dd, life_stage == "Adult")$age_int, na.rm = TRUE) ~ "Adult",
+        TRUE ~ "Old adult"
+      )
+    ) |>
+  add_epred_draws(fit) |>
+  mutate(
+    temp_label = ifelse(
+      lifetime_avg_temp_sc == 0,
+      "Mean temperature",
+      "Warm (+2 SD)"
+    )
+  ) |>
+  group_by(age_int, life_stage, temp_label) |>
+  median_qi(.epred, .width = 0.95)
+
+ggplot(
+  pred_draws,
+  aes(age_int, .epred, color = temp_label, fill = temp_label)
+) +
+  geom_jitter(
+    data = d |> filter(species == "Vendace"),
+    aes(age, l), inherit.aes = FALSE, alpha = 0.5, height = 0, width = 0.3,
+    size = 0.5, color = "grey50"
+  ) +
+  geom_text(
+    data = f_labels, aes(label = label, hjust = -0.1, vjust = 1.5), inherit.aes = FALSE,
+    x = -Inf, y = Inf, size = 2.3, color = "grey20"
+  ) +
+  geom_errorbar(aes(ymin = .lower, ymax = .upper),
+    width = 0, alpha = 0.7, position = position_dodge(width = 0.4)
+  ) +
+  geom_point(position = position_dodge(width = 0.4)) +
+  labs(
+    x = "Age (years)",
+    y = "Predicted length (cm)",
+    color = "Temperature",
+    fill = "Temperature"
+  ) +
+  scale_color_manual(
+    values = brewer.pal(n = 9, name = "Set1")[2:1]
+  ) +
+  scale_fill_manual(
+    values = brewer.pal(n = 9, name = "Set1")[2:1]
+  ) +
+  guides(
+    fill = "none",
+    color = guide_legend(title.position = "top", title.hjust = 0.5)
+  ) +
+  theme(
+    legend.position.inside = c(0.67, 0.12),
+    legend.direction = "horizontal",
+    legend.key.width = unit(0.6, "cm"),
+    legend.key.height = unit(0.1, "cm")
+  )
+```
+
